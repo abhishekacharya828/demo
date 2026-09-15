@@ -1,0 +1,2357 @@
+pipeline {
+    agent { label 'AS_DEV_1_252' }
+    environment {
+        GITLAB_USER      = 'biswajita'
+        GITLAB_TOKEN     = "<token>"
+        BACKEND_REPO     = "http://${GITLAB_USER}:${GITLAB_TOKEN}@192.168.12.135:8085/products-and-rnd/cliqtest/as"
+        JAVA_HOME        = '/usr/lib/jvm/java-21-openjdk-amd64'
+        PATH             = "${JAVA_HOME}/bin:${env.PATH}"
+        SONAR_HOST       = 'http://192.168.14.49:9001'
+        SONAR_USER_TOKEN = 'squ_cf9d9f5bd0cc69ead02ac1508f5082c3ec64ae2c'
+        // MAIL_TO          = 'prabhat.padhy@ap2l.ai, savita.patil@ap2l.ai, gopal.pradhan@ap2l.ai, kadira.maruf@ap2l.ai, biswajita.panigrahi@ap2l.ai,satyajit.sahoo@ap2l.ai,ankit.jaiswal.ap2l.ai,abhishek.acharya@ap2l.ai'
+        WORKSPACE_DIR    = '/home/apmosys/newbuild/as-CliqTest_AS_original'
+        BACKEND_DIR      = "${WORKSPACE_DIR}/AS_backend/AS_backend"
+        FRONTEND_DIR     = "${WORKSPACE_DIR}/AS_backend/AS_frontend"
+        MAIL_TO          = 'abhishekacharya828@gmail.com, abhishek.acharya@ap2l.ai'
+        
+        SBOM_URL         = 'http://192.168.12.125:8081'
+        USER_EMAIL       = 'jenkins@ap2l.ai'
+        USER_PASS        = 'Apmosys@123'
+        USER_ID          = '10'
+        PROJECT_ID       = '95'
+
+        FRONTEND_DIST    = "${WORKSPACE_DIR}/AS_backend/AS_frontend/dist/ngasa-proj/browser"
+        GATEWAY_DIR      = "${WORKSPACE_DIR}/AS_backend/AS_backend/cloud-gateway-service"
+        GATEWAY_STATIC   = "${GATEWAY_DIR}/src/main/resources/static"
+    }
+
+    stages {
+
+        // ================================================================
+        // STAGE 1 — Detect trigger type + select services
+        // CRON   → env.IS_CRON=true  , all services auto-selected
+        // MANUAL → env.IS_CRON=false , user picks services via checkbox UI
+        // ================================================================
+        stage('Select Services To Deploy') {
+            steps {
+                script {
+                    def causes = currentBuild.getBuildCauses()
+                    def isCron = causes.any { it._class.contains('TimerTriggerCause') }
+                    env.IS_CRON = isCron.toString()
+
+                    // Maps deploy-key (underscored, used for env.SVC / docker-compose
+                    // service names) → Maven module directory name (hyphenated)
+                    def dirMap = [
+                        api_testing_service     : 'api-testing-service',
+                        cloud_gateway_service   : 'cloud-gateway-service',
+                        custom_function_service : 'custom-function-service',
+                        project_creation_service: 'project-creation-service',
+                        project_execute_service : 'project-execute-service',
+                        scheduler_service       : 'scheduler-service',
+                        service_registry        : 'service-registry',
+                        user_service            : 'user-service'
+                    ]
+
+                    if (isCron) {
+                        echo "===================================="
+                        echo "CRON TRIGGER DETECTED"
+                        echo "FULL PIPELINE: BUILD ALL + SCAN + DEPLOY ALL"
+                        echo "===================================="
+
+                        env.SVC            = dirMap.keySet().join(' ')
+                        // cloud-gateway-service is built separately (bundled with
+                        // the Angular frontend), so exclude it from the plain Maven loop
+                        env.BUILD_SERVICES = dirMap.findAll { k, v -> k != 'cloud_gateway_service' }.values().join(' ')
+                        env.DEPLOY_GATEWAY = 'true'
+
+                    } else {
+                        echo "===================================="
+                        echo "MANUAL TRIGGER DETECTED"
+                        echo "PIPELINE: BUILD ONLY SELECTED SVC(S) + DEPLOY"
+                        echo "SONAR / SBOM / CNES / MAIL → SKIPPED"
+                        echo "===================================="
+
+                        def services = input(
+                            message: 'Select service(s) to deploy',
+                            parameters: [
+                                booleanParam(name: 'api_testing_service',      defaultValue: false),
+                                booleanParam(name: 'cloud_gateway_service',    defaultValue: false),
+                                booleanParam(name: 'custom_function_service',  defaultValue: false),
+                                booleanParam(name: 'project_creation_service', defaultValue: false),
+                                booleanParam(name: 'project_execute_service',  defaultValue: false),
+                                booleanParam(name: 'scheduler_service',        defaultValue: false),
+                                booleanParam(name: 'service_registry',         defaultValue: false),
+                                booleanParam(name: 'user_service',             defaultValue: false)
+                            ]
+                        )
+
+                        def selectedKeys = services.findAll { it.value }.keySet()
+
+                        if (!selectedKeys) {
+                            error "No service selected. Aborting."
+                        }
+
+                        env.SVC = selectedKeys.join(' ')
+
+                        // cloud-gateway-service has its own dedicated build stage
+                        // (Angular + gateway JAR), so it's excluded from the plain
+                        // Maven loop and instead gated via DEPLOY_GATEWAY
+                        env.BUILD_SERVICES = selectedKeys.findAll { it != 'cloud_gateway_service' }
+                                                          .collect { dirMap[it] }
+                                                          .join(' ')
+                        env.DEPLOY_GATEWAY = selectedKeys.contains('cloud_gateway_service').toString()
+                    }
+
+                    echo "===================================="
+                    echo "TRIGGER         : ${isCron ? 'CRON (build all + scan + deploy all)' : 'MANUAL (build selected + deploy selected)'}"
+                    echo "DEPLOY SVC      : ${env.SVC}"
+                    echo "MAVEN BUILD SVC : ${env.BUILD_SERVICES}"
+                    echo "BUILD GATEWAY   : ${env.DEPLOY_GATEWAY}"
+                    echo "===================================="
+                }
+            }
+        }
+
+        // ================================================================
+        // STAGE 2 — Git Checkout  (always runs)
+        // ================================================================
+        stage('Git Checkout') {
+            steps {
+                dir("${WORKSPACE_DIR}/AS_backend") {
+                    git branch: 'CliqTest_AS_original', url: "${BACKEND_REPO}"
+                }
+            }
+        }
+
+        // ================================================================
+        // STAGE 3 — Maven Build  (always runs)
+        //           CRON   → builds ALL 8 services
+        //           MANUAL → builds ONLY the selected service(s)
+        //           Sequential one-by-one to avoid resource exhaustion.
+        // ================================================================
+        stage('Maven Build (Selected/All Services)') {
+            steps {
+                sh """
+                    export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+                    export PATH=\$JAVA_HOME/bin:\$PATH
+
+                    echo "Java version: \$(java -version 2>&1)"
+                    echo "Services to build: ${env.BUILD_SERVICES}"
+
+                    for SVC in ${env.BUILD_SERVICES}; do
+                        echo "============================================"
+                        echo "Maven Build: \$SVC"
+                        echo "============================================"
+
+                        cd ${BACKEND_DIR}/\$SVC
+
+                        JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 \
+                        PATH=/usr/lib/jvm/java-21-openjdk-amd64/bin:\$PATH \
+                        ./mvnw clean package -DskipTests \
+                            -Dmaven.repo.local=/home/apmosys/.m2/repository
+
+                        echo "✅ Build done: \$SVC"
+                        echo ""
+                    done
+
+                    echo "Maven build(s) completed."
+                """
+            }
+        }
+
+// ================================================================
+// STAGE 4 — Sonar Scan
+//           CRON   → scans all services
+//           MANUAL → scans only selected services
+//           Uses Maven Sonar plugin — no SonarScanner required
+// ================================================================
+stage('Sonar Scan (Selected Services)') {
+    steps {
+        script {
+
+            def sonarServices = [
+                api_testing_service      : 'api-testing-service',
+                cloud_gateway_service    : 'cloud-gateway-service',
+                custom_function_service  : 'custom-function-service',
+                project_creation_service : 'project-creation-service',
+                project_execute_service  : 'project-execute-service',
+                scheduler_service        : 'scheduler-service',
+                service_registry         : 'service-registry',
+                user_service             : 'user-service'
+            ]
+
+            def selectedServices = env.SVC.split()
+
+            echo "============================================"
+            echo "Sonar Scan - Selected Services"
+            echo "============================================"
+            echo "Selected services: ${env.SVC}"
+            echo "============================================"
+
+            selectedServices.each { svcKey ->
+
+                def svc = sonarServices[svcKey]
+
+                if (!svc) {
+                    echo "⚠️ Unknown service: ${svcKey}"
+                    return
+                }
+
+                echo ""
+                echo "============================================"
+                echo "Sonar Scan: ${svc}"
+                echo "============================================"
+
+                sh """
+                    export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+                    export PATH="\$JAVA_HOME/bin:\$PATH"
+
+                    cd "${BACKEND_DIR}/${svc}"
+
+                    echo "Running SonarQube analysis for ${svc}..."
+
+                    ./mvnw org.sonarsource.scanner.maven:sonar-maven-plugin:5.8.0.7211:sonar \
+                         -Dsonar.projectKey=AS_${svc} \
+                         -Dsonar.projectName=AS_${svc} \
+                         -Dsonar.host.url="${SONAR_HOST}" \
+                         -Dsonar.login="${SONAR_USER_TOKEN}"
+
+                    echo "✅ Sonar scan done: ${svc}"
+                """
+            }
+
+            echo ""
+            echo "============================================"
+            echo "All selected Sonar scans completed."
+            echo "============================================"
+        }
+    }
+}
+
+        // ================================================================
+        // STAGE 5 — Angular Build + Copy to Gateway + Gateway JAR
+        //           (always runs — needed for deploy in both modes)
+        // ================================================================
+        stage('Build Frontend in Docker + Build Gateway') {
+    when {
+        expression { env.DEPLOY_GATEWAY == 'true' }
+    }
+
+    steps {
+        sh """
+        set -e
+
+        export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+        export PATH=\$JAVA_HOME/bin:\$PATH
+
+        echo "======================================"
+        echo "Building Angular inside Docker"
+        echo "======================================"
+
+        cd ${FRONTEND_DIR}
+
+        docker build -t angular-builder:latest -f Dockerfile .
+
+        docker rm -f angular-builder >/dev/null 2>&1 || true
+
+        docker run -d --name angular-builder angular-builder:latest
+
+        echo "======================================"
+        echo "Copy browser build to Gateway"
+        echo "======================================"
+
+        rm -rf "${GATEWAY_STATIC}"
+        mkdir -p "${GATEWAY_STATIC}"
+
+        docker cp \
+            angular-builder:/app/dist/ngasa-proj/browser/. \
+            "${GATEWAY_STATIC}/"
+
+        docker rm -f angular-builder
+
+        echo "======================================"
+        echo "Building cloud-gateway-service"
+        echo "======================================"
+
+        cd ${GATEWAY_DIR}
+
+        ./mvnw clean package \
+            -DskipTests \
+            -Dmaven.repo.local=/home/apmosys/.m2/repository
+
+        echo "Gateway build completed."
+        """
+    }
+}
+
+  
+        // ================================================================
+// STAGE — Syft + Grype Security Scan
+//
+// IMPORTANT:
+// JAR NEVER LEAVES THIS JENKINS SERVER.
+//
+// Syft and Grype are installed directly on 252.
+//
+// JAR
+//  ↓
+// Syft → CycloneDX SBOM
+//  ↓
+// Grype → Vulnerability JSON
+//  ↓
+// HTML Security Report
+// ================================================================
+
+stage('Syft + Grype Security Scan') {
+
+    steps {
+
+        script {
+
+            def securityServices = [
+                api_testing_service      : 'api-testing-service',
+                cloud_gateway_service    : 'cloud-gateway-service',
+                custom_function_service  : 'custom-function-service',
+                project_creation_service : 'project-creation-service',
+                project_execute_service  : 'project-execute-service',
+                scheduler_service        : 'scheduler-service',
+                service_registry         : 'service-registry',
+                user_service             : 'user-service'
+            ]
+
+            def selectedServices =
+                env.SVC.trim().split(/\s+/)
+
+            sh '''
+                set -e
+
+                SECURITY_DIR="${WORKSPACE}/security-reports"
+
+                rm -rf "${SECURITY_DIR}"
+
+                mkdir -p "${SECURITY_DIR}"
+
+                echo "============================================"
+                echo "DevSecOps Security Scanner"
+                echo "============================================"
+
+                echo "Syft:"
+                syft version
+
+                echo ""
+                echo "Grype:"
+                grype version
+
+                echo ""
+                echo "Security report directory:"
+                echo "${SECURITY_DIR}"
+
+                echo "============================================"
+            '''
+
+            selectedServices.each { svcKey ->
+
+                def svc =
+                    securityServices[svcKey]
+
+                if (!svc) {
+
+                    error(
+                        "No security mapping found for ${svcKey}"
+                    )
+                }
+
+
+                def jarName
+
+                if (svc == 'project-execute-service') {
+
+                    jarName =
+                        'project-execution-service.jar'
+
+                } else {
+
+                    jarName =
+                        "${svc}.jar"
+                }
+
+
+                def jarPath =
+                    "${BACKEND_DIR}/${svc}/target/${jarName}"
+
+
+                def serviceReportDir =
+                    "${WORKSPACE}/security-reports/${svc}"
+
+
+                echo ""
+                echo "============================================"
+                echo "Security Scan: ${svc}"
+                echo "============================================"
+
+                sh """
+                    set -e
+
+                    mkdir -p "${serviceReportDir}"
+
+                    if [ ! -f "${jarPath}" ]; then
+
+                        echo "ERROR: JAR not found:"
+                        echo "${jarPath}"
+
+                        exit 1
+
+                    fi
+
+                    echo ""
+                    echo "JAR:"
+                    ls -lh "${jarPath}"
+
+                    echo ""
+                    echo "--------------------------------------------"
+                    echo "SYFT - Generating CycloneDX SBOM"
+                    echo "--------------------------------------------"
+
+                    syft \\
+                        "${jarPath}" \\
+                        -o cyclonedx-json \\
+                        > "${serviceReportDir}/${svc}-sbom.json"
+
+                    echo ""
+                    echo "SBOM generated:"
+                    ls -lh "${serviceReportDir}/${svc}-sbom.json"
+
+
+                    echo ""
+                    echo "--------------------------------------------"
+                    echo "GRYPE - Vulnerability Scan"
+                    echo "--------------------------------------------"
+
+                    grype \\
+                        "sbom:${serviceReportDir}/${svc}-sbom.json" \\
+                        -o json \\
+                        > "${serviceReportDir}/${svc}-grype.json"
+
+                    echo ""
+                    echo "Grype report generated:"
+                    ls -lh "${serviceReportDir}/${svc}-grype.json"
+
+
+                    echo ""
+                    echo "--------------------------------------------"
+                    echo "Generating Human Readable HTML Report"
+                    echo "--------------------------------------------"
+
+                    SCAN_SERVICE="${svc}" \\
+                    SCAN_JAR="${jarPath}" \\
+                    SBOM_FILE="${serviceReportDir}/${svc}-sbom.json" \\
+                    GRYPE_FILE="${serviceReportDir}/${svc}-grype.json" \\
+                    HTML_FILE="${serviceReportDir}/${svc}-security-report.html" \\
+                    BUILD_NUMBER="${BUILD_NUMBER}" \\
+                    python3 /home/apmosys/devsecops-reports/generate-html-report.py
+
+
+                    echo ""
+                    echo "Security scan completed:"
+                    echo "${svc}"
+
+                """
+            }
+
+
+            // ====================================================
+            // CREATE ONE ZIP FOR ALL SECURITY REPORTS
+            // ====================================================
+
+            sh '''
+                set -e
+
+                cd "${WORKSPACE}/security-reports"
+
+                echo ""
+                echo "============================================"
+                echo "Creating Security Reports Archive"
+                echo "============================================"
+
+                rm -f "${WORKSPACE}/security-reports-all.zip"
+
+                zip -r \
+                    "${WORKSPACE}/security-reports-all.zip" \
+                    .
+
+                echo ""
+                echo "Security archive:"
+                ls -lh "${WORKSPACE}/security-reports-all.zip"
+
+                echo ""
+                echo "Security scan completed successfully."
+            '''
+
+        }
+    }
+}
+stage('Generate CNES Reports') {
+    agent { label 'LI_192.168.14.49' }
+
+    steps {
+        script {
+
+            def selectedServices = env.SVC?.trim() ? env.SVC.trim().split(/\s+/) : []
+
+            if (selectedServices.length == 0) {
+                error "No services selected for CNES report generation."
+            }
+
+            def projects = selectedServices.collect { svc ->
+                "AS_${svc.replace('_', '-')}"
+            }
+
+            echo "============================================"
+            echo "CNES Report Generation"
+            echo "============================================"
+            echo "Selected services: ${env.SVC}"
+            echo "CNES projects: ${projects.join(' ')}"
+            echo "============================================"
+
+            sh """
+                set -e
+
+                export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+                export PATH=\$JAVA_HOME/bin:\$PATH
+
+                BASE=/home/apmosys/sonar-reports
+                mkdir -p "\${BASE}"
+
+                PROJECTS="${projects.join(' ')}"
+
+                for PROJECT in \$PROJECTS; do
+
+                    echo "======================================"
+                    echo "Generating CNES report for \$PROJECT"
+                    echo "======================================"
+
+                    mkdir -p "\${BASE}/\${PROJECT}"
+
+                    java -jar /home/apmosys/sonarqube/plugins/sonar-cnes-report-4.2.0.jar \\
+                        -s http://192.168.14.49:9001 \\
+                        -t "\${SONAR_USER_TOKEN}" \\
+                        -p "\${PROJECT}" \\
+                        -o "\${BASE}/\${PROJECT}"
+
+                    echo "Saved: \${BASE}/\${PROJECT}"
+                done
+
+                echo "======================================"
+                echo "Zipping CNES reports"
+                echo "======================================"
+
+                cd "\${BASE}"
+
+                rm -f sonar-cnes-report-all.zip
+
+                zip -r sonar-cnes-report-all.zip \$PROJECTS
+
+                ls -lh "\${BASE}/sonar-cnes-report-all.zip"
+
+                cp "\${BASE}/sonar-cnes-report-all.zip" \
+                    "\${WORKSPACE}/sonar-cnes-report-all.zip"
+            """
+        }
+    }
+}
+        // ================================================================
+        // STAGE 10 — Parse CNES Reports  (CRON only)
+        // ================================================================
+        // ================================================================
+// STAGE 10 — Parse CNES Reports
+//           MANUAL + CRON
+// ================================================================
+stage('Parse CNES Reports') {
+    agent { label 'LI_192.168.14.49' }
+
+    steps {
+        script {
+
+            def selectedServices = env.SVC?.trim()
+                ? env.SVC.trim().split(/\s+/)
+                : []
+
+            def projects = selectedServices.collect { svc ->
+                "AS_${svc.replace('_', '-')}"
+            }
+
+            echo "============================================"
+            echo "Parsing CNES Reports"
+            echo "============================================"
+            echo "Projects: ${projects.join(' ')}"
+            echo "============================================"
+
+            sh """
+                set -e
+
+                export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+                export PATH=\$JAVA_HOME/bin:\$PATH
+
+                BASE=/home/apmosys/sonar-reports
+
+                python3 /home/apmosys/scripts/parse_cnes_summary.py \\
+                    --base "\${BASE}" \\
+                    --projects ${projects.join(' ')} \\
+                    --output "\${WORKSPACE}/cnes_summary.json"
+
+                echo "======================================"
+                echo "Summary JSON"
+                echo "======================================"
+
+                cat "\${WORKSPACE}/cnes_summary.json"
+            """
+
+            stash includes: 'cnes_summary.json', name: 'cnes-summary'
+
+            echo '✅ CNES metrics parsed and stashed.'
+        }
+    }
+}
+
+        // ================================================================
+       // ================================================================
+// STAGE 11 — Send Combined SonarQube + Syft + Grype Email
+// ================================================================
+stage('Send Email') {
+
+    agent { label 'LI_192.168.14.49' }
+
+    steps {
+
+        // ------------------------------------------------------------
+        // Restore reports generated on AS_DEV_1_252
+        // ------------------------------------------------------------
+        unstash 'cnes-summary'
+        unstash 'security-summary'
+        unstash 'security-reports'
+
+        sh '''
+            echo "===== Email Reports ====="
+
+            echo "--- CNES ---"
+            ls -lh "${WORKSPACE}/sonar-cnes-report-all.zip" || true
+            ls -lh "${WORKSPACE}/cnes_summary.json" || true
+
+            echo "--- Security ---"
+            ls -lh "${WORKSPACE}/security-summary.json" || true
+            ls -lh "${WORKSPACE}/security-reports-all.zip" || true
+
+            echo "========================="
+        '''
+
+        script {
+
+            // ========================================================
+            // SONARQUBE / CNES SUMMARY
+            // ========================================================
+
+            def summary = readJSON(
+                file: "${WORKSPACE}/cnes_summary.json"
+            )
+
+            def totalBugs       = 0
+            def totalVulns      = 0
+            def totalSmells     = 0
+            def totalBlocker    = 0
+            def totalCritical   = 0
+            def totalMajor      = 0
+            def totalMinor      = 0
+            def totalInfo       = 0
+            def totalIssues     = 0
+
+            summary.each { proj, d ->
+
+                totalBugs      += (d.bugs             ?: 0) as Integer
+                totalVulns     += (d.vulnerabilities ?: 0) as Integer
+                totalSmells    += (d.code_smells      ?: 0) as Integer
+                totalBlocker   += (d.blocker          ?: 0) as Integer
+                totalCritical  += (d.critical         ?: 0) as Integer
+                totalMajor     += (d.major            ?: 0) as Integer
+                totalMinor     += (d.minor            ?: 0) as Integer
+                totalInfo      += (d.info             ?: 0) as Integer
+                totalIssues    += (d.total_issues     ?: 0) as Integer
+            }
+
+
+            // ========================================================
+            // SYFT + GRYPE SECURITY SUMMARY
+            // ========================================================
+
+            def securitySummary = readJSON(
+                file: "${WORKSPACE}/security-summary.json"
+            )
+
+            def totalSecurityCritical = 0
+            def totalSecurityHigh     = 0
+            def totalSecurityMedium   = 0
+            def totalSecurityLow      = 0
+            def totalSecurityNegligible = 0
+            def totalSecurityUnknown  = 0
+            def totalSecurity         = 0
+            def totalComponents      = 0
+
+            securitySummary.each { service, d ->
+
+                totalSecurityCritical += (d.critical   ?: 0) as Integer
+                totalSecurityHigh     += (d.high       ?: 0) as Integer
+                totalSecurityMedium   += (d.medium     ?: 0) as Integer
+                totalSecurityLow      += (d.low        ?: 0) as Integer
+                totalSecurityNegligible += (d.negligible ?: 0) as Integer
+                totalSecurityUnknown  += (d.unknown    ?: 0) as Integer
+                totalSecurity         += (d.total      ?: 0) as Integer
+                totalComponents       += (d.components ?: 0) as Integer
+            }
+
+
+            // ========================================================
+            // OVERALL HEALTH
+            // ========================================================
+
+            def healthBadge
+            def healthColor
+            def healthBg
+
+            if (totalBlocker > 0 || totalSecurityCritical > 0) {
+
+                healthBadge = '🔴 ACTION REQUIRED'
+                healthColor = '#B91C1C'
+                healthBg    = '#FEE2E2'
+
+            } else if (
+                totalCritical > 0 ||
+                totalSecurityHigh > 0
+            ) {
+
+                healthBadge = '🟠 REVIEW NEEDED'
+                healthColor = '#C2410C'
+                healthBg    = '#FFEDD5'
+
+            } else {
+
+                healthBadge = '🟢 ALL CLEAR'
+                healthColor = '#15803D'
+                healthBg    = '#DCFCE7'
+            }
+
+
+            // ========================================================
+            // SONAR PER-SERVICE TABLE
+            // ========================================================
+
+            def sonarTableRows = ''
+            def sonarRowIndex = 0
+
+            summary.each { project, d ->
+
+                def shortName = project
+                    .replace('AS_', '')
+                    .split('-')
+                    .collect { it.capitalize() }
+                    .join(' ')
+
+                def bugs     = (d.bugs             ?: 0) as Integer
+                def vulns    = (d.vulnerabilities ?: 0) as Integer
+                def smells   = (d.code_smells      ?: 0) as Integer
+                def blocker  = (d.blocker          ?: 0) as Integer
+                def critical = (d.critical         ?: 0) as Integer
+                def major    = (d.major            ?: 0) as Integer
+                def minor    = (d.minor            ?: 0) as Integer
+                def info     = (d.info             ?: 0) as Integer
+                def total    = (d.total_issues     ?: 0) as Integer
+
+                def date = d.report_date ?: 'N/A'
+                def hasErr = d.error ? ' ⚠' : ''
+
+                def rowBg =
+                    sonarRowIndex % 2 == 0
+                        ? '#FFFFFF'
+                        : '#F8FAFC'
+
+                def bugClr =
+                    bugs > 0 ? '#B91C1C' : '#15803D'
+
+                def vulnClr =
+                    vulns > 0 ? '#B91C1C' : '#15803D'
+
+                def blockerClr =
+                    blocker > 0 ? '#B91C1C' : '#6B7280'
+
+                def criticalClr =
+                    critical > 0 ? '#C2410C' : '#6B7280'
+
+                def gateIcon =
+                    (blocker > 0 || bugs > 0 || vulns > 0)
+                        ? '🔴'
+                        : (critical > 0 || major > 0)
+                            ? '🟠'
+                            : '🟢'
+
+                sonarTableRows += """
+                    <tr style="background:${rowBg};">
+
+                        <td style="padding:10px 14px;border-bottom:1px solid #E2E8F0;font-weight:500;color:#1E293B;white-space:nowrap;">
+                            ${gateIcon} ${shortName}${hasErr}
+                        </td>
+
+                        <td style="padding:10px 14px;border-bottom:1px solid #E2E8F0;text-align:center;color:${bugClr};font-weight:600;">
+                            ${bugs}
+                        </td>
+
+                        <td style="padding:10px 14px;border-bottom:1px solid #E2E8F0;text-align:center;color:${vulnClr};font-weight:600;">
+                            ${vulns}
+                        </td>
+
+                        <td style="padding:10px 14px;border-bottom:1px solid #E2E8F0;text-align:center;color:#7C3AED;">
+                            ${smells}
+                        </td>
+
+                        <td style="padding:10px 14px;border-bottom:1px solid #E2E8F0;text-align:center;color:${blockerClr};font-weight:${blocker > 0 ? '700' : '400'};">
+                            ${blocker}
+                        </td>
+
+                        <td style="padding:10px 14px;border-bottom:1px solid #E2E8F0;text-align:center;color:${criticalClr};font-weight:${critical > 0 ? '700' : '400'};">
+                            ${critical}
+                        </td>
+
+                        <td style="padding:10px 14px;border-bottom:1px solid #E2E8F0;text-align:center;color:#92400E;">
+                            ${major}
+                        </td>
+
+                        <td style="padding:10px 14px;border-bottom:1px solid #E2E8F0;text-align:center;color:#374151;">
+                            ${minor}
+                        </td>
+
+                        <td style="padding:10px 14px;border-bottom:1px solid #E2E8F0;text-align:center;color:#6B7280;">
+                            ${info}
+                        </td>
+
+                        <td style="padding:10px 14px;border-bottom:1px solid #E2E8F0;text-align:center;font-weight:700;color:#0F172A;">
+                            ${total}
+                        </td>
+
+                        <td style="padding:10px 14px;border-bottom:1px solid #E2E8F0;text-align:center;color:#94A3B8;font-size:11px;">
+                            ${date}
+                        </td>
+
+                    </tr>
+                """
+
+                sonarRowIndex++
+            }
+
+
+            // ========================================================
+            // SONAR TOTAL ROW
+            // ========================================================
+
+            def sonarFooterRow = """
+                <tr style="background:#0F172A;">
+
+                    <td style="padding:12px 14px;color:#F1F5F9;font-weight:700;">
+                        TOTALS
+                    </td>
+
+                    <td style="padding:12px 14px;text-align:center;color:${totalBugs > 0 ? '#FCA5A5' : '#86EFAC'};font-weight:700;">
+                        ${totalBugs}
+                    </td>
+
+                    <td style="padding:12px 14px;text-align:center;color:${totalVulns > 0 ? '#FCA5A5' : '#86EFAC'};font-weight:700;">
+                        ${totalVulns}
+                    </td>
+
+                    <td style="padding:12px 14px;text-align:center;color:#C4B5FD;font-weight:700;">
+                        ${totalSmells}
+                    </td>
+
+                    <td style="padding:12px 14px;text-align:center;color:${totalBlocker > 0 ? '#FCA5A5' : '#94A3B8'};font-weight:700;">
+                        ${totalBlocker}
+                    </td>
+
+                    <td style="padding:12px 14px;text-align:center;color:${totalCritical > 0 ? '#FED7AA' : '#94A3B8'};font-weight:700;">
+                        ${totalCritical}
+                    </td>
+
+                    <td style="padding:12px 14px;text-align:center;color:#FDE68A;font-weight:700;">
+                        ${totalMajor}
+                    </td>
+
+                    <td style="padding:12px 14px;text-align:center;color:#94A3B8;font-weight:700;">
+                        ${totalMinor}
+                    </td>
+
+                    <td style="padding:12px 14px;text-align:center;color:#94A3B8;font-weight:700;">
+                        ${totalInfo}
+                    </td>
+
+                    <td style="padding:12px 14px;text-align:center;color:#F1F5F9;font-weight:700;font-size:14px;">
+                        ${totalIssues}
+                    </td>
+
+                    <td style="padding:12px 14px;color:#64748B;font-size:11px;">
+                        all services
+                    </td>
+
+                </tr>
+            """
+
+
+            // ========================================================
+            // GRYPE PER-SERVICE TABLE
+            // ========================================================
+
+            def securityTableRows = ''
+            def securityRowIndex = 0
+
+            securitySummary.each { service, d ->
+
+                def displayName = service
+                    .replace('_service', '')
+                    .replace('_', ' ')
+                    .split(' ')
+                    .collect { it.capitalize() }
+                    .join(' ')
+
+                def components =
+                    (d.components ?: 0) as Integer
+
+                def critical =
+                    (d.critical ?: 0) as Integer
+
+                def high =
+                    (d.high ?: 0) as Integer
+
+                def medium =
+                    (d.medium ?: 0) as Integer
+
+                def low =
+                    (d.low ?: 0) as Integer
+
+                def negligible =
+                    (d.negligible ?: 0) as Integer
+
+                def unknown =
+                    (d.unknown ?: 0) as Integer
+
+                def total =
+                    (d.total ?: 0) as Integer
+
+                def jarName =
+                    d.jar ?: d.jar_name ?: 'N/A'
+
+                def rowBg =
+                    securityRowIndex % 2 == 0
+                        ? '#FFFFFF'
+                        : '#F8FAFC'
+
+                def securityIcon =
+                    critical > 0
+                        ? '🔴'
+                        : high > 0
+                            ? '🟠'
+                            : medium > 0
+                                ? '🟡'
+                                : '🟢'
+
+                securityTableRows += """
+                    <tr style="background:${rowBg};">
+
+                        <td style="padding:10px 14px;border-bottom:1px solid #E2E8F0;font-weight:500;color:#1E293B;white-space:nowrap;">
+                            ${securityIcon} ${displayName}
+                        </td>
+
+                        <td style="padding:10px 14px;border-bottom:1px solid #E2E8F0;color:#475569;font-size:11px;">
+                            ${jarName}
+                        </td>
+
+                        <td style="padding:10px 14px;border-bottom:1px solid #E2E8F0;text-align:center;color:#475569;">
+                            ${components}
+                        </td>
+
+                        <td style="padding:10px 14px;border-bottom:1px solid #E2E8F0;text-align:center;color:${critical > 0 ? '#B91C1C' : '#15803D'};font-weight:${critical > 0 ? '700' : '500'};">
+                            ${critical}
+                        </td>
+
+                        <td style="padding:10px 14px;border-bottom:1px solid #E2E8F0;text-align:center;color:${high > 0 ? '#C2410C' : '#15803D'};font-weight:${high > 0 ? '700' : '500'};">
+                            ${high}
+                        </td>
+
+                        <td style="padding:10px 14px;border-bottom:1px solid #E2E8F0;text-align:center;color:${medium > 0 ? '#A16207' : '#15803D'};font-weight:${medium > 0 ? '600' : '500'};">
+                            ${medium}
+                        </td>
+
+                        <td style="padding:10px 14px;border-bottom:1px solid #E2E8F0;text-align:center;color:#64748B;">
+                            ${low}
+                        </td>
+
+                        <td style="padding:10px 14px;border-bottom:1px solid #E2E8F0;text-align:center;color:#94A3B8;">
+                            ${negligible}
+                        </td>
+
+                        <td style="padding:10px 14px;border-bottom:1px solid #E2E8F0;text-align:center;color:#94A3B8;">
+                            ${unknown}
+                        </td>
+
+                        <td style="padding:10px 14px;border-bottom:1px solid #E2E8F0;text-align:center;font-weight:800;color:#0F172A;">
+                            ${total}
+                        </td>
+
+                    </tr>
+                """
+
+                securityRowIndex++
+            }
+
+
+            // ========================================================
+            // GRYPE TOTAL ROW
+            // ========================================================
+
+            def securityFooterRow = """
+                <tr style="background:#0F172A;">
+
+                    <td colspan="2" style="padding:12px 14px;color:#F1F5F9;font-weight:700;">
+                        SECURITY TOTALS
+                    </td>
+
+                    <td style="padding:12px 14px;text-align:center;color:#CBD5E1;font-weight:700;">
+                        ${totalComponents}
+                    </td>
+
+                    <td style="padding:12px 14px;text-align:center;color:${totalSecurityCritical > 0 ? '#FCA5A5' : '#86EFAC'};font-weight:700;">
+                        ${totalSecurityCritical}
+                    </td>
+
+                    <td style="padding:12px 14px;text-align:center;color:${totalSecurityHigh > 0 ? '#FED7AA' : '#86EFAC'};font-weight:700;">
+                        ${totalSecurityHigh}
+                    </td>
+
+                    <td style="padding:12px 14px;text-align:center;color:${totalSecurityMedium > 0 ? '#FDE68A' : '#86EFAC'};font-weight:700;">
+                        ${totalSecurityMedium}
+                    </td>
+
+                    <td style="padding:12px 14px;text-align:center;color:#CBD5E1;font-weight:700;">
+                        ${totalSecurityLow}
+                    </td>
+
+                    <td style="padding:12px 14px;text-align:center;color:#94A3B8;font-weight:700;">
+                        ${totalSecurityNegligible}
+                    </td>
+
+                    <td style="padding:12px 14px;text-align:center;color:#94A3B8;font-weight:700;">
+                        ${totalSecurityUnknown}
+                    </td>
+
+                    <td style="padding:12px 14px;text-align:center;color:#F8FAFC;font-weight:800;font-size:14px;">
+                        ${totalSecurity}
+                    </td>
+
+                </tr>
+            """
+
+
+            // ========================================================
+            // TOP GRYPE FINDINGS
+            //
+            // Read individual Grype JSON reports from the ZIP/workspace
+            // if they are available after unstash.
+            // ========================================================
+
+            def topFindingsRows = ''
+
+            sh '''
+                rm -rf "${WORKSPACE}/security-email-reports"
+                mkdir -p "${WORKSPACE}/security-email-reports"
+
+                if [ -f "${WORKSPACE}/security-reports-all.zip" ]; then
+                    unzip -o "${WORKSPACE}/security-reports-all.zip" \
+                        -d "${WORKSPACE}/security-email-reports" >/dev/null 2>&1 || true
+                fi
+            '''
+
+            def grypeFiles = sh(
+                script: """
+                    find "${WORKSPACE}/security-email-reports" \\
+                        -type f \\
+                        \\( -name '*-grype.json' -o -name '*vulnerabilities.json' \\) \\
+                        | sort
+                """,
+                returnStdout: true
+            ).trim()
+
+            def findingList = []
+
+            if (grypeFiles) {
+
+                grypeFiles.split('\\n').each { filePath ->
+
+                    try {
+
+                        def grypeData = readJSON(
+                            file: filePath
+                        )
+
+                        def serviceName =
+                            new File(filePath)
+                                .getName()
+                                .replace('-grype.json', '')
+                                .replace('-vulnerabilities.json', '')
+
+                        def matches =
+                            grypeData.matches ?: []
+
+                        matches.each { finding ->
+
+                            def vulnerability =
+                                finding.vulnerability ?: [:]
+
+                            def artifact =
+                                finding.artifact ?: [:]
+
+                            def severity =
+                                (vulnerability.severity ?: 'Unknown')
+                                    .toString()
+                                    .toUpperCase()
+
+                            if (
+                                severity == 'CRITICAL' ||
+                                severity == 'HIGH'
+                            ) {
+
+                                def cvssValue = ''
+
+                                if (
+                                    vulnerability.cvss &&
+                                    vulnerability.cvss.size() > 0
+                                ) {
+                                    cvssValue =
+                                        vulnerability.cvss[0]?.metrics?.baseScore ?:
+                                        vulnerability.cvss[0]?.baseScore ?:
+                                        ''
+                                }
+
+                                def fixedVersion = ''
+
+                                if (
+                                    finding.remediate &&
+                                    finding.remediate.versions
+                                ) {
+                                    fixedVersion =
+                                        finding.remediate.versions
+                                            .join(', ')
+                                }
+
+                                if (!fixedVersion) {
+                                    fixedVersion =
+                                        vulnerability.fix?.versions
+                                            ? vulnerability.fix.versions.join(', ')
+                                            : 'Not available'
+                                }
+
+                                findingList << [
+                                    severity: severity,
+                                    packageName: artifact.name ?: 'Unknown',
+                                    installed: artifact.version ?: 'Unknown',
+                                    fixed: fixedVersion,
+                                    cvss: cvssValue ?: 'N/A',
+                                    service: serviceName,
+                                    id: vulnerability.id ?: 'N/A'
+                                ]
+                            }
+                        }
+
+                    } catch (Exception e) {
+
+                        echo "Unable to parse Grype file ${filePath}: ${e.message}"
+                    }
+                }
+            }
+
+
+            // Sort Critical first, then High
+            findingList.sort { a, b ->
+
+                def severityOrder = [
+                    'CRITICAL': 0,
+                    'HIGH': 1
+                ]
+
+                severityOrder[a.severity] <=> severityOrder[b.severity]
+            }
+
+
+            // Show maximum 15 findings
+            findingList.take(15).eachWithIndex { finding, index ->
+
+                def sev = finding.severity
+
+                def sevColor =
+                    sev == 'CRITICAL'
+                        ? '#B91C1C'
+                        : '#C2410C'
+
+                def sevBg =
+                    sev == 'CRITICAL'
+                        ? '#FEF2F2'
+                        : '#FFF7ED'
+
+                def packageName = finding.packageName
+                def installed = finding.installed
+                def fixed = finding.fixed
+                def cvss = finding.cvss
+                def service = finding.service
+                def vulnId = finding.id
+
+                topFindingsRows += """
+                    <tr>
+
+                        <td style="padding:9px 10px;border-bottom:1px solid #E2E8F0;">
+                            <span style="display:inline-block;background:${sevBg};color:${sevColor};padding:4px 8px;border-radius:5px;font-size:10px;font-weight:700;">
+                                ${sev}
+                            </span>
+                        </td>
+
+                        <td style="padding:9px 10px;border-bottom:1px solid #E2E8F0;color:#0F172A;font-weight:600;">
+                            ${packageName}
+                            <div style="font-size:9px;color:#94A3B8;margin-top:2px;">
+                                ${vulnId}
+                            </div>
+                        </td>
+
+                        <td style="padding:9px 10px;border-bottom:1px solid #E2E8F0;color:#475569;">
+                            ${installed}
+                        </td>
+
+                        <td style="padding:9px 10px;border-bottom:1px solid #E2E8F0;color:#15803D;font-weight:600;">
+                            ${fixed}
+                        </td>
+
+                        <td style="padding:9px 10px;border-bottom:1px solid #E2E8F0;text-align:center;color:#7C3AED;font-weight:700;">
+                            ${cvss}
+                        </td>
+
+                        <td style="padding:9px 10px;border-bottom:1px solid #E2E8F0;color:#64748B;font-size:10px;">
+                            ${service}
+                        </td>
+
+                    </tr>
+                """
+            }
+
+
+            if (!topFindingsRows) {
+
+                topFindingsRows = """
+                    <tr>
+                        <td colspan="6"
+                            style="padding:18px;text-align:center;color:#15803D;font-weight:600;">
+                            🟢 No Critical or High Grype vulnerabilities found.
+                        </td>
+                    </tr>
+                """
+            }
+
+
+            // ========================================================
+            // DATE / SUBJECT
+            // ========================================================
+
+            def scanDate =
+                new Date().format(
+                    'dd MMM yyyy, HH:mm z',
+                    TimeZone.getTimeZone('Asia/Kolkata')
+                )
+
+            def emailSubject
+
+            if (
+                totalBlocker > 0 ||
+                totalSecurityCritical > 0
+            ) {
+
+                emailSubject =
+                    "🔴 ACTION REQUIRED — CliqTest NGASA · " +
+                    "${totalSecurityCritical} Critical Security Findings · " +
+                    "Build #${BUILD_NUMBER}"
+
+            } else if (
+                totalCritical > 0 ||
+                totalSecurityHigh > 0
+            ) {
+
+                emailSubject =
+                    "🟠 REVIEW NEEDED — CliqTest NGASA · " +
+                    "${totalSecurityHigh} High Security Findings · " +
+                    "Build #${BUILD_NUMBER}"
+
+            } else {
+
+                emailSubject =
+                    "✅ ALL CLEAR — CliqTest NGASA · Build #${BUILD_NUMBER}"
+            }
+
+
+            // ========================================================
+            // SEND EMAIL
+            // ========================================================
+
+            emailext(
+
+                to: "${env.MAIL_TO}",
+
+                subject: emailSubject,
+
+                mimeType: 'text/html',
+
+                attachmentsPattern:
+                    "sonar-cnes-report-all.zip,security-reports-all.zip",
+
+                body: """<!DOCTYPE html>
+
+<html lang="en">
+
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+</head>
+
+<body style="margin:0;padding:0;background:#F1F5F9;font-family:'Segoe UI',Arial,sans-serif;">
+
+<table width="100%" cellpadding="0" cellspacing="0"
+       style="background:#F1F5F9;padding:32px 16px;">
+
+<tr>
+<td align="center">
+
+<table width="900" cellpadding="0" cellspacing="0"
+       style="max-width:900px;width:100%;background:#FFFFFF;border-radius:16px;overflow:hidden;box-shadow:0 8px 40px rgba(15,23,42,0.12);">
+
+<!-- TOP BAR -->
+
+<tr>
+<td style="background:linear-gradient(90deg,#4F46E5,#0EA5E9,#10B981);height:5px;font-size:0;">
+&nbsp;
+</td>
+</tr>
+
+
+<!-- HEADER -->
+
+<tr>
+
+<td style="background:#0F172A;padding:32px 40px;">
+
+<table width="100%" cellpadding="0" cellspacing="0">
+
+<tr>
+
+<td>
+
+<div style="font-size:10px;font-weight:700;letter-spacing:3px;color:#4F46E5;text-transform:uppercase;margin-bottom:8px;">
+APMOSYS PRODUCTS · DEVOPS
+</div>
+
+<div style="font-size:25px;font-weight:700;color:#F8FAFC;margin-bottom:4px;">
+CliqTest NGASA
+</div>
+
+<div style="font-size:13px;color:#94A3B8;margin-bottom:16px;">
+Code Quality &amp; Security Report · ${scanDate}
+</div>
+
+<span style="display:inline-block;background:${healthBg};color:${healthColor};font-size:12px;font-weight:700;padding:5px 14px;border-radius:100px;">
+${healthBadge}
+</span>
+
+</td>
+
+
+<td align="right" valign="top">
+
+<div style="font-size:10px;color:#64748B;text-align:right;text-transform:uppercase;letter-spacing:1px;">
+Build
+</div>
+
+<div style="font-size:32px;font-weight:800;color:#4F46E5;line-height:1;">
+#${BUILD_NUMBER}
+</div>
+
+<div style="font-size:11px;color:#64748B;margin-top:5px;">
+AS_BACKEND + AS_FRONTEND
+</div>
+
+</td>
+
+</tr>
+
+</table>
+
+</td>
+
+</tr>
+
+
+<!-- ========================================================= -->
+<!-- EXECUTIVE SUMMARY -->
+<!-- ========================================================= -->
+
+<tr>
+
+<td style="background:#F8FAFC;padding:20px 32px;border-bottom:1px solid #E2E8F0;">
+
+<table width="100%" cellpadding="0" cellspacing="6">
+
+<tr>
+
+<!-- Sonar Total -->
+
+<td width="16%" align="center">
+
+<div style="background:#FFFFFF;border:1px solid #E2E8F0;border-radius:10px;padding:13px 5px;">
+
+<div style="font-size:24px;font-weight:800;color:#0F172A;">
+${totalIssues}
+</div>
+
+<div style="font-size:8px;color:#64748B;margin-top:3px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;">
+Sonar Issues
+</div>
+
+</div>
+
+</td>
+
+
+<!-- Bugs -->
+
+<td width="16%" align="center">
+
+<div style="background:${totalBugs > 0 ? '#FEF2F2' : '#F0FDF4'};border:1px solid ${totalBugs > 0 ? '#FECACA' : '#BBF7D0'};border-radius:10px;padding:13px 5px;">
+
+<div style="font-size:24px;font-weight:800;color:${totalBugs > 0 ? '#B91C1C' : '#15803D'};">
+${totalBugs}
+</div>
+
+<div style="font-size:8px;color:#64748B;margin-top:3px;font-weight:600;text-transform:uppercase;">
+🐛 Bugs
+</div>
+
+</div>
+
+</td>
+
+
+<!-- Sonar Vulns -->
+
+<td width="16%" align="center">
+
+<div style="background:${totalVulns > 0 ? '#FEF2F2' : '#F0FDF4'};border:1px solid ${totalVulns > 0 ? '#FECACA' : '#BBF7D0'};border-radius:10px;padding:13px 5px;">
+
+<div style="font-size:24px;font-weight:800;color:${totalVulns > 0 ? '#B91C1C' : '#15803D'};">
+${totalVulns}
+</div>
+
+<div style="font-size:8px;color:#64748B;margin-top:3px;font-weight:600;text-transform:uppercase;">
+🔐 Sonar Vulns
+</div>
+
+</div>
+
+</td>
+
+
+<!-- Blockers -->
+
+<td width="16%" align="center">
+
+<div style="background:${totalBlocker > 0 ? '#FEF2F2' : '#F8FAFC'};border:1px solid ${totalBlocker > 0 ? '#FECACA' : '#E2E8F0'};border-radius:10px;padding:13px 5px;">
+
+<div style="font-size:24px;font-weight:800;color:${totalBlocker > 0 ? '#B91C1C' : '#94A3B8'};">
+${totalBlocker}
+</div>
+
+<div style="font-size:8px;color:#64748B;margin-top:3px;font-weight:600;text-transform:uppercase;">
+🚨 Blockers
+</div>
+
+</div>
+
+</td>
+
+
+<!-- Grype Critical -->
+
+<td width="16%" align="center">
+
+<div style="background:${totalSecurityCritical > 0 ? '#FEF2F2' : '#F0FDF4'};border:1px solid ${totalSecurityCritical > 0 ? '#FECACA' : '#BBF7D0'};border-radius:10px;padding:13px 5px;">
+
+<div style="font-size:24px;font-weight:800;color:${totalSecurityCritical > 0 ? '#B91C1C' : '#15803D'};">
+${totalSecurityCritical}
+</div>
+
+<div style="font-size:8px;color:#64748B;margin-top:3px;font-weight:600;text-transform:uppercase;">
+🔴 Grype Critical
+</div>
+
+</div>
+
+</td>
+
+
+<!-- Grype High -->
+
+<td width="16%" align="center">
+
+<div style="background:${totalSecurityHigh > 0 ? '#FFF7ED' : '#F0FDF4'};border:1px solid ${totalSecurityHigh > 0 ? '#FED7AA' : '#BBF7D0'};border-radius:10px;padding:13px 5px;">
+
+<div style="font-size:24px;font-weight:800;color:${totalSecurityHigh > 0 ? '#C2410C' : '#15803D'};">
+${totalSecurityHigh}
+</div>
+
+<div style="font-size:8px;color:#64748B;margin-top:3px;font-weight:600;text-transform:uppercase;">
+🟠 Grype High
+</div>
+
+</div>
+
+</td>
+
+</tr>
+
+
+<tr>
+
+<!-- Grype Medium -->
+
+<td width="16%" align="center">
+
+<div style="background:#FFFBEB;border:1px solid #FDE68A;border-radius:10px;padding:11px 5px;">
+
+<div style="font-size:22px;font-weight:800;color:#A16207;">
+${totalSecurityMedium}
+</div>
+
+<div style="font-size:8px;color:#64748B;margin-top:3px;font-weight:600;text-transform:uppercase;">
+🟡 Medium
+</div>
+
+</div>
+
+</td>
+
+
+<!-- Grype Low -->
+
+<td width="16%" align="center">
+
+<div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:10px;padding:11px 5px;">
+
+<div style="font-size:22px;font-weight:800;color:#64748B;">
+${totalSecurityLow}
+</div>
+
+<div style="font-size:8px;color:#64748B;margin-top:3px;font-weight:600;text-transform:uppercase;">
+Low
+</div>
+
+</div>
+
+</td>
+
+
+<!-- Total CVEs -->
+
+<td width="16%" align="center">
+
+<div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:10px;padding:11px 5px;">
+
+<div style="font-size:22px;font-weight:800;color:#0F172A;">
+${totalSecurity}
+</div>
+
+<div style="font-size:8px;color:#64748B;margin-top:3px;font-weight:600;text-transform:uppercase;">
+Total CVEs
+</div>
+
+</div>
+
+</td>
+
+
+<!-- Components -->
+
+<td width="16%" align="center">
+
+<div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:10px;padding:11px 5px;">
+
+<div style="font-size:22px;font-weight:800;color:#0F172A;">
+${totalComponents}
+</div>
+
+<div style="font-size:8px;color:#64748B;margin-top:3px;font-weight:600;text-transform:uppercase;">
+SBOM Components
+</div>
+
+</div>
+
+</td>
+
+
+<td width="16%"></td>
+<td width="16%"></td>
+
+</tr>
+
+</table>
+
+</td>
+
+</tr>
+
+
+<!-- ========================================================= -->
+<!-- SONAR SECTION -->
+<!-- ========================================================= -->
+
+<tr>
+
+<td style="padding:28px 40px 12px 40px;">
+
+<div style="font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#64748B;">
+📋 Per-Service SonarQube Breakdown
+</div>
+
+</td>
+
+</tr>
+
+
+<tr>
+
+<td style="padding:0 40px 28px 40px;">
+
+<table width="100%" cellpadding="0" cellspacing="0"
+       style="border-radius:10px;overflow:hidden;border:1px solid #E2E8F0;border-collapse:separate;border-spacing:0;">
+
+<thead>
+
+<tr style="background:#1E293B;">
+
+<th style="padding:11px 10px;text-align:left;color:#94A3B8;font-size:9px;text-transform:uppercase;">
+Service
+</th>
+
+<th style="padding:11px 8px;text-align:center;color:#FCA5A5;font-size:9px;text-transform:uppercase;">
+Bugs
+</th>
+
+<th style="padding:11px 8px;text-align:center;color:#FCA5A5;font-size:9px;text-transform:uppercase;">
+Vulns
+</th>
+
+<th style="padding:11px 8px;text-align:center;color:#C4B5FD;font-size:9px;text-transform:uppercase;">
+Smells
+</th>
+
+<th style="padding:11px 8px;text-align:center;color:#FCA5A5;font-size:9px;text-transform:uppercase;">
+Blocker
+</th>
+
+<th style="padding:11px 8px;text-align:center;color:#FED7AA;font-size:9px;text-transform:uppercase;">
+Critical
+</th>
+
+<th style="padding:11px 8px;text-align:center;color:#FDE68A;font-size:9px;text-transform:uppercase;">
+Major
+</th>
+
+<th style="padding:11px 8px;text-align:center;color:#94A3B8;font-size:9px;text-transform:uppercase;">
+Minor
+</th>
+
+<th style="padding:11px 8px;text-align:center;color:#64748B;font-size:9px;text-transform:uppercase;">
+Info
+</th>
+
+<th style="padding:11px 8px;text-align:center;color:#F1F5F9;font-size:9px;text-transform:uppercase;">
+Total
+</th>
+
+<th style="padding:11px 8px;text-align:center;color:#64748B;font-size:9px;text-transform:uppercase;">
+Date
+</th>
+
+</tr>
+
+</thead>
+
+<tbody>
+${sonarTableRows}
+</tbody>
+
+<tfoot>
+${sonarFooterRow}
+</tfoot>
+
+</table>
+
+</td>
+
+</tr>
+
+
+<!-- ========================================================= -->
+<!-- SECURITY SECTION -->
+<!-- ========================================================= -->
+
+<tr>
+
+<td style="padding:4px 40px 12px 40px;">
+
+<div style="font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#64748B;">
+🛡️ Syft SBOM + Grype Vulnerability Breakdown
+</div>
+
+<div style="font-size:11px;color:#94A3B8;margin-top:5px;">
+JARs were scanned locally on the Jenkins build server. Only security reports are centralized.
+</div>
+
+</td>
+
+</tr>
+
+
+<tr>
+
+<td style="padding:0 40px 28px 40px;">
+
+<table width="100%" cellpadding="0" cellspacing="0"
+       style="border-radius:10px;overflow:hidden;border:1px solid #E2E8F0;border-collapse:separate;border-spacing:0;">
+
+<thead>
+
+<tr style="background:#1E293B;">
+
+<th style="padding:11px 10px;text-align:left;color:#94A3B8;font-size:9px;text-transform:uppercase;">
+Service
+</th>
+
+<th style="padding:11px 8px;text-align:left;color:#94A3B8;font-size:9px;text-transform:uppercase;">
+JAR
+</th>
+
+<th style="padding:11px 8px;text-align:center;color:#C4B5FD;font-size:9px;text-transform:uppercase;">
+Components
+</th>
+
+<th style="padding:11px 8px;text-align:center;color:#FCA5A5;font-size:9px;text-transform:uppercase;">
+Critical
+</th>
+
+<th style="padding:11px 8px;text-align:center;color:#FED7AA;font-size:9px;text-transform:uppercase;">
+High
+</th>
+
+<th style="padding:11px 8px;text-align:center;color:#FDE68A;font-size:9px;text-transform:uppercase;">
+Medium
+</th>
+
+<th style="padding:11px 8px;text-align:center;color:#94A3B8;font-size:9px;text-transform:uppercase;">
+Low
+</th>
+
+<th style="padding:11px 8px;text-align:center;color:#94A3B8;font-size:9px;text-transform:uppercase;">
+Negligible
+</th>
+
+<th style="padding:11px 8px;text-align:center;color:#64748B;font-size:9px;text-transform:uppercase;">
+Unknown
+</th>
+
+<th style="padding:11px 8px;text-align:center;color:#F1F5F9;font-size:9px;text-transform:uppercase;">
+Total
+</th>
+
+</tr>
+
+</thead>
+
+<tbody>
+${securityTableRows}
+</tbody>
+
+<tfoot>
+${securityFooterRow}
+</tfoot>
+
+</table>
+
+</td>
+
+</tr>
+
+
+<!-- ========================================================= -->
+<!-- TOP FINDINGS -->
+<!-- ========================================================= -->
+
+<tr>
+
+<td style="padding:0 40px 12px 40px;">
+
+<div style="font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#64748B;">
+🚨 Top Critical &amp; High Vulnerabilities
+</div>
+
+<div style="font-size:11px;color:#94A3B8;margin-top:5px;">
+Highest-priority findings detected by Grype. Complete findings are available in the attached JSON report.
+</div>
+
+</td>
+
+</tr>
+
+
+<tr>
+
+<td style="padding:0 40px 28px 40px;">
+
+<table width="100%" cellpadding="0" cellspacing="0"
+       style="border:1px solid #E2E8F0;border-radius:10px;overflow:hidden;border-collapse:separate;border-spacing:0;">
+
+<thead>
+
+<tr style="background:#F8FAFC;">
+
+<th style="padding:10px;text-align:left;color:#64748B;font-size:9px;text-transform:uppercase;">
+Severity
+</th>
+
+<th style="padding:10px;text-align:left;color:#64748B;font-size:9px;text-transform:uppercase;">
+Package / Vulnerability
+</th>
+
+<th style="padding:10px;text-align:left;color:#64748B;font-size:9px;text-transform:uppercase;">
+Installed
+</th>
+
+<th style="padding:10px;text-align:left;color:#15803D;font-size:9px;text-transform:uppercase;">
+Fixed Version
+</th>
+
+<th style="padding:10px;text-align:center;color:#7C3AED;font-size:9px;text-transform:uppercase;">
+CVSS
+</th>
+
+<th style="padding:10px;text-align:left;color:#64748B;font-size:9px;text-transform:uppercase;">
+Service
+</th>
+
+</tr>
+
+</thead>
+
+<tbody>
+
+${topFindingsRows}
+
+</tbody>
+
+</table>
+
+</td>
+
+</tr>
+
+
+<!-- ========================================================= -->
+<!-- RECOMMENDED ACTION -->
+<!-- ========================================================= -->
+
+<tr>
+
+<td style="padding:0 40px 28px 40px;">
+
+<table width="100%" cellpadding="0" cellspacing="0">
+
+<tr>
+
+<td style="background:${totalSecurityCritical > 0 ? '#FEF2F2' : '#F8FAFC'};border:1px solid ${totalSecurityCritical > 0 ? '#FECACA' : '#E2E8F0'};border-radius:10px;padding:16px 18px;">
+
+<div style="font-size:11px;font-weight:700;color:#475569;text-transform:uppercase;letter-spacing:1px;margin-bottom:7px;">
+Recommended Action
+</div>
+
+<div style="font-size:13px;color:#1E293B;line-height:1.6;">
+
+${
+    totalSecurityCritical > 0
+        ? "🔴 <strong>Immediate attention required:</strong> Critical vulnerabilities were detected. Upgrade affected dependencies to their fixed versions and review the Critical findings before production deployment."
+        : totalSecurityHigh > 0
+            ? "🟠 <strong>Review required:</strong> High-severity vulnerabilities were detected. Prioritize dependency upgrades and review the affected services before production deployment."
+            : totalSecurity > 0
+                ? "🟡 Vulnerabilities were detected. Review the attached Grype report and plan dependency upgrades based on severity."
+                : "🟢 No Grype vulnerabilities were detected. No immediate security remediation is required."
+}
+
+</div>
+
+</td>
+
+</tr>
+
+</table>
+
+</td>
+
+</tr>
+
+
+<!-- ========================================================= -->
+<!-- ATTACHMENTS -->
+<!-- ========================================================= -->
+
+<tr>
+
+<td style="padding:0 40px;">
+
+<div style="height:1px;background:#E2E8F0;"></div>
+
+</td>
+
+</tr>
+
+
+<tr>
+
+<td style="padding:24px 40px;">
+
+<div style="font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#64748B;margin-bottom:12px;">
+📎 Attachments
+</div>
+
+
+<table width="100%" cellpadding="0" cellspacing="0">
+
+
+<tr>
+
+<td style="padding:12px 16px;background:#F8FAFC;border:1px solid #E2E8F0;border-radius:8px;">
+
+<table width="100%" cellpadding="0" cellspacing="0">
+
+<tr>
+
+<td>
+
+<div style="font-weight:600;color:#0F172A;font-size:13px;">
+📄 sonar-cnes-report-all.zip
+</div>
+
+<div style="color:#64748B;font-size:11px;margin-top:2px;">
+Full CNES reports (DOCX + XLSX) for all services
+</div>
+
+</td>
+
+<td align="right">
+
+<span style="font-size:10px;background:#EFF6FF;color:#1D4ED8;padding:3px 10px;border-radius:100px;font-weight:600;">
+SONAR / CNES
+</span>
+
+</td>
+
+</tr>
+
+</table>
+
+</td>
+
+</tr>
+
+
+<tr>
+<td style="height:8px;"></td>
+</tr>
+
+
+<tr>
+
+<td style="padding:12px 16px;background:#F8FAFC;border:1px solid #E2E8F0;border-radius:8px;">
+
+<table width="100%" cellpadding="0" cellspacing="0">
+
+<tr>
+
+<td>
+
+<div style="font-weight:600;color:#0F172A;font-size:13px;">
+🛡️ security-reports-all.zip
+</div>
+
+<div style="color:#64748B;font-size:11px;margin-top:2px;">
+Syft SBOM + Grype JSON + HTML vulnerability reports for all scanned JARs
+</div>
+
+</td>
+
+<td align="right">
+
+<span style="font-size:10px;background:#F0FDF4;color:#15803D;padding:3px 10px;border-radius:100px;font-weight:600;">
+SYFT / GRYPE
+</span>
+
+</td>
+
+</tr>
+
+</table>
+
+</td>
+
+</tr>
+
+
+</table>
+
+</td>
+
+</tr>
+
+
+<!-- ========================================================= -->
+<!-- FOOTER -->
+<!-- ========================================================= -->
+
+<tr>
+
+<td style="padding:0 40px;">
+
+<div style="height:1px;background:#E2E8F0;"></div>
+
+</td>
+
+</tr>
+
+
+<tr>
+
+<td style="padding:24px 40px;">
+
+<table width="100%" cellpadding="0" cellspacing="0">
+
+<tr>
+
+<td>
+
+<div style="font-size:13px;color:#374151;">
+Regards,
+</div>
+
+<div style="font-size:15px;font-weight:700;color:#0F172A;margin-top:4px;">
+CI/CD Automation Pipeline 🤖
+</div>
+
+<div style="font-size:11px;color:#94A3B8;margin-top:2px;">
+APMOSYS PRODUCTS - DevOps Team
+</div>
+
+</td>
+
+
+<td align="right">
+
+<div style="font-size:11px;color:#CBD5E1;text-align:right;">
+
+<div>
+Jenkins · SonarQube · CNES · Syft · Grype
+</div>
+
+<div style="margin-top:2px;">
+Build <strong style="color:#94A3B8;">
+#${BUILD_NUMBER}
+</strong>
+</div>
+
+</div>
+
+</td>
+
+</tr>
+
+</table>
+
+</td>
+
+</tr>
+
+
+<tr>
+
+<td style="background:#0F172A;padding:14px 40px;">
+
+<table width="100%" cellpadding="0" cellspacing="0">
+
+<tr>
+
+<td style="font-size:11px;color:#475569;">
+🤖 Automated notification — do not reply directly.
+</td>
+
+<td align="right" style="font-size:11px;color:#334155;">
+CliqTest NGASA · ApMoSys
+</td>
+
+</tr>
+
+</table>
+
+</td>
+
+</tr>
+
+
+<tr>
+
+<td style="background:linear-gradient(90deg,#10B981,#0EA5E9,#4F46E5);height:4px;font-size:0;">
+&nbsp;
+</td>
+
+</tr>
+
+
+</table>
+
+</td>
+</tr>
+
+</table>
+
+</body>
+
+</html>"""
+            )
+        }
+    }
+}
+
+        // ================================================================
+        // STAGE 12 — Backup Existing JARs  (always runs)
+        // ================================================================
+        stage('Backup Existing JARs') {
+            steps {
+                script {
+                    def services = env.SVC.trim().split(/\s+/)
+                    for (svc in services) {
+                        sh """
+                            set -e
+                            APP_DIR=/home/apmosys/cliQTest_AS
+                            BACKUP_DIR=/home/apmosys/backeup
+                            TIME=\$(date +%Y%m%d_%H%M%S)
+                            mkdir -p \$BACKUP_DIR
+
+                            case "${svc}" in
+                                api_testing_service)      SRC=\$APP_DIR/apitesting_service/api-testing-service.jar;           BACKUP_NAME=api-testing-service.jar ;;
+                                cloud_gateway_service)    SRC=\$APP_DIR/cloud_gateway_service/cloud-gateway-service.jar;       BACKUP_NAME=cloud-gateway-service.jar ;;
+                                custom_function_service)  SRC=\$APP_DIR/custom_function_service/custom-function-service.jar;   BACKUP_NAME=custom-function-service.jar ;;
+                                project_creation_service) SRC=\$APP_DIR/project_creation_service/project-creation-service.jar; BACKUP_NAME=project-creation-service.jar ;;
+                                project_execute_service)  SRC=\$APP_DIR/project_execution_service/project-execution-service.jar; BACKUP_NAME=project-execution-service.jar ;;
+                                scheduler_service)        SRC=\$APP_DIR/scheduler_service/scheduler-service.jar;               BACKUP_NAME=scheduler-service.jar ;;
+                                service_registry)         SRC=\$APP_DIR/service_registry/service-registry.jar;                BACKUP_NAME=service-registry.jar ;;
+                                user_service)             SRC=\$APP_DIR/user_service/user-service.jar;                        BACKUP_NAME=user-service.jar ;;
+                            esac
+
+                            if [ -f "\$SRC" ]; then
+                                cp "\$SRC" "\$BACKUP_DIR/\${BACKUP_NAME}_\$TIME"
+                                ls -1t \$BACKUP_DIR/\${BACKUP_NAME}_* | tail -n +3 | xargs -r rm -f
+                                echo "✅ Backup completed: ${svc}"
+                            else
+                                echo "⚠️ JAR not found: \$SRC"
+                            fi
+                        """
+                    }
+                }
+            }
+        }
+
+        // ================================================================
+        // STAGE 13 — Copy JARs to CliQTest_AS  (always runs)
+        // ================================================================
+        stage('Copy JARs To CliQTest_AS') {
+            steps {
+                script {
+                    def services = env.SVC.trim().split(/\s+/)
+                    for (svc in services) {
+                        sh """
+                            set -e
+                            SOURCE=/home/apmosys/sbom-scanner
+                            TARGET=/home/apmosys/cliQTest_AS
+
+                            case "${svc}" in
+                                api_testing_service)      cp \$SOURCE/api-testing-service.jar      \$TARGET/apitesting_service/ ;;
+                                cloud_gateway_service)    cp \$SOURCE/cloud-gateway-service.jar    \$TARGET/cloud_gateway_service/ ;;
+                                custom_function_service)  cp \$SOURCE/custom-function-service.jar  \$TARGET/custom_function_service/ ;;
+                                project_creation_service) cp \$SOURCE/project-creation-service.jar \$TARGET/project_creation_service/ ;;
+                                project_execute_service)  cp \$SOURCE/project-execution-service.jar \$TARGET/project_execution_service/ ;;
+                                scheduler_service)        cp \$SOURCE/scheduler-service.jar        \$TARGET/scheduler_service/ ;;
+                                service_registry)         cp \$SOURCE/service-registry.jar         \$TARGET/service_registry/ ;;
+                                user_service)             cp \$SOURCE/user-service.jar             \$TARGET/user_service/ ;;
+                            esac
+
+                            echo "✅ Copied: ${svc}"
+                        """
+                    }
+                }
+            }
+        }
+
+        // ================================================================
+        // STAGE 14 — Docker Build & Restart  (always runs)
+        // ================================================================
+        stage('Docker Build & Restart Services') {
+    steps {
+        script {
+
+            // Jenkins selection key → actual Docker Compose service name
+            def dockerServiceMap = [
+                api_testing_service      : 'apitesting_service',
+                cloud_gateway_service    : 'cloud_gateway_service',
+                custom_function_service  : 'custom_function_service',
+                project_creation_service : 'project_creation_service',
+                project_execute_service  : 'project_execution_service',
+                scheduler_service        : 'scheduler_service',
+                service_registry         : 'service_registry',
+                user_service             : 'user_service'
+            ]
+
+            def selectedServices = env.SVC.trim().split(/\s+/)
+
+            def dockerServices = selectedServices.collect { svcKey ->
+
+                def dockerService = dockerServiceMap[svcKey]
+
+                if (!dockerService) {
+                    error "No Docker Compose mapping found for: ${svcKey}"
+                }
+
+                return dockerService
+            }.join(' ')
+
+            echo "===================================="
+            echo "Jenkins Selected Services"
+            echo "===================================="
+            echo "${env.SVC}"
+
+            echo "===================================="
+            echo "Docker Compose Services"
+            echo "===================================="
+            echo "${dockerServices}"
+
+            sh """
+                set -e
+
+                cd /home/apmosys/cliQTest_AS
+
+                echo "===================================="
+                echo "--- Docker Build ---"
+                echo "===================================="
+
+                docker compose build ${dockerServices}
+
+                echo "===================================="
+                echo "--- Container Restart ---"
+                echo "===================================="
+
+                docker compose up -d --force-recreate ${dockerServices}
+
+                echo "===================================="
+                echo "--- Status ---"
+                echo "===================================="
+
+                docker compose ps
+
+                echo "===================================="
+                echo "--- Pruning unused images ---"
+                echo "===================================="
+
+                docker image prune -f
+
+                echo "✅ Docker deployment complete."
+            """
+        }
+    }
+}
+
+        // ================================================================
+        // STAGE 15 — Deployment Notification Email  (CRON only)
+        // ================================================================
+        stage('Send Deployment Notification') {
+            when { expression { return env.IS_CRON == 'true' } }
+            steps {
+                emailext(
+                    to: "${MAIL_TO}",
+                    mimeType: 'text/html',
+                    subject: "✅ SUCCESS - cliQTest Deployment Completed | Build #${BUILD_NUMBER}",
+                    body: """
+<html>
+<body style="margin:0;padding:0;background:#f5f7fa;font-family:Segoe UI,Arial,sans-serif;">
+<div style="max-width:900px;margin:30px auto;background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 8px 24px rgba(0,0,0,0.08);">
+    <div style="background:#0f172a;padding:30px 40px;">
+        <table width="100%"><tr>
+            <td><h1 style="margin:0;color:#ffffff;font-size:26px;font-weight:600;">cliQTest Deployment Report</h1><p style="margin-top:8px;color:#cbd5e1;font-size:14px;">Automated CI/CD Deployment Notification</p></td>
+            <td align="right"><div style="display:inline-block;background:#16a34a;color:white;padding:10px 18px;border-radius:30px;font-size:13px;font-weight:600;">DEPLOYMENT SUCCESSFUL</div></td>
+        </tr></table>
+    </div>
+    <div style="padding:35px 40px;">
+        <h2 style="margin-top:0;color:#0f172a;font-size:20px;">Deployment Completed Successfully</h2>
+        <p style="font-size:15px;color:#475569;line-height:1.8;">The latest CliqTest application artifacts were successfully deployed. Backup, artifact replacement, Docker image rebuild, container recreation, and service startup all completed successfully.</p>
+        <table width="100%" cellspacing="0" cellpadding="0" style="margin-top:25px;"><tr>
+            <td width="32%"><div style="border:1px solid #e2e8f0;border-radius:10px;padding:18px;"><div style="font-size:12px;color:#64748b;">APPLICATION</div><div style="margin-top:8px;font-size:18px;font-weight:600;color:#0f172a;">CliqTest</div></div></td>
+            <td width="2%"></td>
+            <td width="32%"><div style="border:1px solid #e2e8f0;border-radius:10px;padding:18px;"><div style="font-size:12px;color:#64748b;">BUILD NUMBER</div><div style="margin-top:8px;font-size:18px;font-weight:600;color:#0f172a;">#${BUILD_NUMBER}</div></div></td>
+            <td width="2%"></td>
+            <td width="32%"><div style="border:1px solid #e2e8f0;border-radius:10px;padding:18px;"><div style="font-size:12px;color:#64748b;">STATUS</div><div style="margin-top:8px;font-size:18px;font-weight:600;color:#16a34a;">SUCCESS</div></div></td>
+        </tr></table>
+        <h3 style="margin-top:35px;color:#0f172a;">Deployment Activities</h3>
+        <table width="100%" style="border-collapse:collapse;border:1px solid #e2e8f0;">
+            <tr style="background:#f8fafc;"><th align="left" style="padding:12px;border-bottom:1px solid #e2e8f0;">Activity</th><th align="center" style="padding:12px;border-bottom:1px solid #e2e8f0;">Result</th></tr>
+            <tr><td style="padding:12px;border-bottom:1px solid #e2e8f0;">JAR Backup</td><td align="center" style="padding:12px;color:#16a34a;font-weight:600;">Completed</td></tr>
+            <tr><td style="padding:12px;border-bottom:1px solid #e2e8f0;">Artifact Copy</td><td align="center" style="padding:12px;color:#16a34a;font-weight:600;">Completed</td></tr>
+            <tr><td style="padding:12px;border-bottom:1px solid #e2e8f0;">Docker Build</td><td align="center" style="padding:12px;color:#16a34a;font-weight:600;">Completed</td></tr>
+            <tr><td style="padding:12px;border-bottom:1px solid #e2e8f0;">Container Recreation</td><td align="center" style="padding:12px;color:#16a34a;font-weight:600;">Completed</td></tr>
+            <tr><td style="padding:12px;">Service Startup</td><td align="center" style="padding:12px;color:#16a34a;font-weight:600;">Healthy</td></tr>
+        </table>
+        <div style="margin-top:30px;background:#eff6ff;border-left:4px solid #2563eb;padding:16px;color:#1e3a8a;font-size:14px;">All selected services have been updated with the latest artifacts via Jenkins CI/CD pipeline.</div>
+    </div>
+    <div style="background:#0f172a;color:#94a3b8;text-align:center;padding:18px;font-size:12px;">ApMoSys Products • CliqTest Release Automation Platform</div>
+</div>
+</body>
+</html>"""
+                )
+            }
+        }
+
+    }
+
+    post {
+        failure {
+            emailext(
+                to: "abhishek.acharya@ap2l.ai",
+                subject: "❌ FAILED - Deployment Pipeline Build #${BUILD_NUMBER}",
+                body: """
+Pipeline failed during execution.
+
+Project      : AS_BACKEND
+Build Number : ${BUILD_NUMBER}
+
+Please check Jenkins console logs for details.
+"""
+            )
+        }
+    }
+}
